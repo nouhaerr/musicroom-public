@@ -1,0 +1,83 @@
+/* The rooms pages, in the colours of the shared layout (global.css) and of the mobile app */
+.rooms { display: grid; gap: 20px; }
+.rooms h1 { margin: 6px 0 0; }
+.rooms-header { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 16px; }
+.rooms-create, .rooms-outline { display: inline-flex; align-items: center; gap: 8px; padding: 11px 18px; border: 1.5px solid #aeb5ff; border-radius: 14px; background: transparent; color: #aeb5ff; font: inherit; font-weight: 650; cursor: pointer; }
+.rooms-create:hover, .rooms-outline:hover:not(:disabled) { background: #1e2a5c; text-decoration: none; }
+.rooms-outline:disabled { opacity: 0.45; cursor: not-allowed; }
+.rooms-search { width: 100%; max-width: 560px; padding: 13px 16px; border-radius: 14px; border: 1px solid #292b3a; background: #13141c; color: #f5f5fa; font: inherit; }
+.rooms-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.rooms-chips button { padding: 8px 16px; border: 0; border-radius: 20px; background: #242d3e; color: #b4bdce; font: inherit; font-weight: 600; cursor: pointer; }
+.rooms-chips button[aria-selected="true"] { background: #1e2a5c; color: #a9b6ff; }
+.rooms-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 12px; }
+.rooms-card { display: grid; grid-template-columns: 56px minmax(0, 1fr) 16px; align-items: center; gap: 12px; padding: 12px; border-radius: 16px; background: #171a25; color: #a7adc0; }
+.rooms-card:hover { background: #1e2230; text-decoration: none; }
+.rooms-cover { width: 56px; height: 56px; border-radius: 10px; object-fit: cover; }
+.rooms-blank { display: inline-flex; align-items: center; justify-content: center; background: #242d3e; color: #a9b6ff; }
+.rooms-text { display: grid; gap: 2px; min-width: 0; }
+.rooms-text > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rooms-text strong { color: #f3f3e9; font-size: 17px; }
+.rooms-playing { color: #a9b6ff; font-size: 13px; }
+.rooms-pages { display: flex; gap: 12px; }
+.rooms-error { display: grid; gap: 8px; justify-items: start; }
+.rooms-error p { color: #ff8f8f; }
+.rooms-loading { color: #b7f576; }
+
+/* The room, the playlist and the forms */
+.rooms h2 { margin: 8px 0 0; font-size: 20px; color: #f3f3e9; }
+.rooms-back { justify-self: start; display: inline-flex; align-items: center; gap: 8px; padding: 6px 0; border: 0; background: none; color: #bcc4ff; font: inherit; line-height: 1.25; cursor: pointer; }
+.rooms-back svg { display: block; flex: 0 0 auto; }
+.rooms-alert { color: #ff8f8f; }
+.rooms-note { color: #a9b6ff; font-size: 13px; }
+.rooms-between { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.rooms-list { display: grid; }
+.rooms-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid #3b4355; background: #08090d; }
+.rooms-row > .rooms-text { flex: 1; }
+.rooms-row > :not(.rooms-text) { flex: none; }
+.rooms-thumb { width: 48px; height: 48px; border-radius: 8px; object-fit: cover; background: #242d3e; }
+.rooms-rank { width: 24px; color: #737d91; font-size: 14px; font-variant-numeric: tabular-nums; }
+.rooms-square { width: 44px; height: 44px; display: inline-flex; align-items: center; justify-content: center; border: 1.5px solid #3b4355; border-radius: 12px; background: transparent; color: #a9b6ff; cursor: pointer; }
+.rooms-square:hover:not(:disabled) { border-color: #aeb5ff; text-decoration: none; }
+.rooms-square:disabled { opacity: 0.45; cursor: not-allowed; }
+.rooms-vote { min-width: 52px; min-height: 52px; display: grid; justify-items: center; align-content: center; gap: 2px; border: 1.5px solid #3b4355; border-radius: 12px; background: transparent; color: #f3f3e9; font: inherit; font-weight: 700; cursor: pointer; }
+.rooms-vote:disabled { opacity: 0.45; cursor: not-allowed; }
+.rooms-on { border-color: #aeb5ff; color: #aeb5ff; }
+.rooms-card-box { display: grid; gap: 10px; padding: 16px; border-radius: 16px; background: #171a25; align-content: start; }
+.rooms-now { display: flex; align-items: center; gap: 14px; }
+.rooms-big-cover { width: 72px; height: 72px; border-radius: 12px; object-fit: cover; }
+.rooms-title { font-size: 20px; }
+.rooms-track { height: 4px; border-radius: 2px; background: #242d3e; overflow: hidden; }
+.rooms-track span { display: block; height: 100%; background: #a98bff; }
+.rooms-room-grid { display: grid; grid-template-columns: minmax(0, 380px) minmax(0, 1fr); gap: 24px; align-items: start; }
+.rooms-queue { display: grid; gap: 12px; }
+.rooms-form { width: 100%; max-width: 720px; }
+.rooms-form h1 { font-size: clamp(30px, 3.2vw, 44px); }
+.playlist-access-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px; align-items: start; }
+.playlist-access-group { display: grid; gap: 12px; min-width: 0; }
+.rooms-field { display: grid; gap: 6px; color: #a7adc0; }
+.rooms-field input { padding: 12px 14px; border-radius: 12px; border: 1px solid #292b3a; background: #13141c; color: #f5f5fa; font: inherit; color-scheme: dark; }
+.rooms-choices { display: grid; gap: 10px; }
+.rooms-choice { display: flex; align-items: center; gap: 14px; text-align: left; padding: 14px; border-radius: 14px; border: 1px solid #3b4355; background: #111722; color: #a4adbf; font: inherit; cursor: pointer; }
+.rooms-choice > svg { width: 18px; height: 18px; flex: 0 0 18px; color: #a4adbf; }
+.rooms-choice[aria-checked="true"] > svg { color: #f3f3e9; }
+.rooms-choice-copy { display: grid; gap: 2px; min-width: 0; }
+.rooms-choice strong { color: #f3f3e9; }
+.rooms-chosen { border-color: #4961ee; background: #1e2a5c; }
+.rooms-choice-disabled { opacity: .45; cursor: not-allowed; }
+.rooms-main { justify-self: start; }
+.rooms-map { height: 300px; width: 100%; border-radius: 14px; border: 1px solid #3b4355; }
+.rooms-hours { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.rooms-friends { display: grid; }
+.rooms-friend { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid #3b4355; cursor: pointer; }
+.rooms-friend input { width: 20px; height: 20px; accent-color: #b7f576; }
+@media (max-width: 900px) { .rooms-room-grid, .playlist-access-grid { grid-template-columns: minmax(0, 1fr); } }
+@media (min-width: 761px) and (max-width: 1200px) {
+  .rooms-form { max-width: 640px; gap: 16px; }
+  .rooms-form h2 { font-size: 18px; }
+}
+@media (max-width: 520px) {
+  .rooms-hours { grid-template-columns: minmax(0, 1fr); }
+  .rooms-row { gap: 8px; }
+  .rooms-thumb { width: 40px; height: 40px; }
+}
+@media (max-width: 360px) { .rooms-row .rooms-thumb { display: none; } } /* the smallest phones: the title gets the cover's place */

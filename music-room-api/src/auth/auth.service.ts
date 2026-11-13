@@ -1,0 +1,281 @@
+import { normalizeEmail } from '../common/email';
+import { randomUUID } from 'crypto';
+import { PrismaService } from '../prisma/prisma.service';
+import { SessionsService, tokenHash } from './sessions.service';
+import { lockUsers } from '../common/locks';
+import {
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+  ServiceUnavailableException,
+  UnauthorizedException,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { JwtService, JwtSignOptions } from '@nestjs/jwt';
+import * as bcrypt from 'bcrypt';
+import { UsersService } from '../users/users.service';
+import { MailService } from '../mail/mail.service';
+import { toPublicUser, PublicUser } from '../users/user.mapper';
+import { AuthProvider, User } from '../../generated/prisma';
+import { JwtPayload, TokenType } from './token.types';
+import { FacebookProvider } from './social/facebook.provider';
+import { GoogleProvider } from './social/google.provider';
+
+const SALT_ROUNDS = 12;
+
+export interface AuthTokens {
+  accessToken: string;
+  refreshToken: string;
+}
+
+@Injectable()
+export class AuthService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly sessions: SessionsService,
+    private readonly usersService: UsersService,
+    private readonly mailService: MailService,
+    private readonly jwtService: JwtService,
+    private readonly config: ConfigService,
+    private readonly facebookProvider: FacebookProvider,
+    private readonly googleProvider: GoogleProvider,
+  ) {}
+
+  // ---------------------------------------------------------------------
+  // Inscription email / mot de passe
+  // ---------------------------------------------------------------------
+  async register(email: string, password: string, name: string): Promise<PublicUser> {
+    const existing = await this.usersService.findByEmail(email);
+    if (existing) {
+      throw new ConflictException('An account already exists with this email');
+    }
+
+    const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
+    const user = await this.usersService.createWithPassword({ email, name, passwordHash });
+
+    await this.sendVerificationEmail(user);
+
+    return toPublicUser(user);
+  }
+
+  async sendVerificationEmail(user: User): Promise<void> {
+    const token = this.signPurposeToken(user, 'email-verification', '24h');
+    await this.mailService.sendVerificationEmail(user.email, token);
+  }
+
+  async resendVerification(email: string): Promise<void> {
+    const user = await this.usersService.findByEmail(email);
+    // On ne révèle jamais si l'email existe ou non (anti-énumération de comptes)
+    if (user && !user.emailVerifiedAt) {
+      try {
+        await this.sendVerificationEmail(user);
+      } catch (error) {
+        // Une panne SMTP ne doit pas révéler quels comptes existent.
+        if (!(error instanceof ServiceUnavailableException)) throw error;
+      }
+    }
+  }
+
+  async verifyEmail(token: string): Promise<void> {
+    const payload = this.verifyPurposeToken(token, 'email-verification');
+    await this.usersService.markEmailVerified(payload.sub);
+  }
+
+  // ---------------------------------------------------------------------
+  // Login email / mot de passe (appelé par LocalStrategy)
+  // ---------------------------------------------------------------------
+  async validateUserCredentials(email: string, password: string): Promise<PublicUser> {
+    const user = await this.usersService.findByEmail(email);
+    if (!user || !user.passwordHash) {
+      throw new UnauthorizedException('Invalid email or password');
+    }
+
+    const passwordMatches = await bcrypt.compare(password, user.passwordHash);
+    if (!passwordMatches) {
+      throw new UnauthorizedException('Invalid email or password');
+    }
+
+    if (!user.emailVerifiedAt) {
+      throw new ForbiddenException(
+        "Email not verified. Check your inbox to verify your account.",
+      );
+    }
+
+    return toPublicUser(user);
+  }
+
+  login(user: PublicUser) {
+    return this.sessions.create(user.id, user.updatedAt);
+  }
+
+  refreshTokens(refreshToken: string) {
+    return this.sessions.refresh(refreshToken);
+  }
+
+  logout(userId: string, sessionId: string) {
+    return this.sessions.logout(userId, sessionId);
+  }
+
+  // ---------------------------------------------------------------------
+  // Mot de passe oublié
+  // ---------------------------------------------------------------------
+  async forgotPassword(email: string, client?: 'web' | 'mobile'): Promise<void> {
+    const user = await this.usersService.findByEmail(email);
+    if (user && user.passwordHash) {
+      const token = this.signPurposeToken(user, 'password-reset', '30m');
+      const { exp } = this.jwtService.decode<{ exp: number }>(token);
+      await this.prisma.passwordResetToken.create({ data: {
+        userId: user.id, tokenHash: tokenHash(token), expiresAt: new Date(exp * 1000),
+      } });
+      try {
+        await this.mailService.sendPasswordResetEmail(user.email, token, false, client);
+      } catch (error) {
+        if (!(error instanceof ServiceUnavailableException)) throw error;
+      }
+    }
+    // Réponse générique quoi qu'il arrive côté contrôleur (anti-énumération)
+  }
+
+  async requestPasswordSetup(userId: string, client?: 'web' | 'mobile'): Promise<void> {
+    const user = await this.usersService.findById(userId);
+    if (!user) throw new UnauthorizedException('Account not found');
+    if (user.passwordHash) throw new ConflictException('A password is already set. Request a reset link using forgot-password.');
+    const token = this.signPurposeToken(user, 'password-reset', '30m');
+    const { exp } = this.jwtService.decode<{ exp: number }>(token);
+    await this.prisma.passwordResetToken.create({ data: {
+      userId, tokenHash: tokenHash(token), expiresAt: new Date(exp * 1000),
+    } });
+    await this.mailService.sendPasswordResetEmail(user.email, token, true, client);
+  }
+
+  async resetPassword(token: string, newPassword: string): Promise<void> {
+    const payload = this.verifyPurposeToken(token, 'password-reset');
+    const passwordHash = await bcrypt.hash(newPassword, SALT_ROUNDS);
+    await this.prisma.$transaction(async tx => {
+      await lockUsers(tx, [payload.sub]);
+      const user = await tx.user.findUnique({ where: { id: payload.sub } });
+      if (!user || normalizeEmail(user.email) !== normalizeEmail(payload.email ?? '')) throw new UnauthorizedException('This link is no longer valid');
+      const consumed = await tx.passwordResetToken.updateMany({
+        where: { userId: payload.sub, tokenHash: tokenHash(token), usedAt: null, expiresAt: { gt: new Date() } },
+        data: { usedAt: new Date() },
+      });
+      if (consumed.count !== 1) throw new UnauthorizedException('This link has expired or has already been used');
+      await tx.user.update({ where: { id: payload.sub }, data: { passwordHash, emailVerifiedAt: user.emailVerifiedAt ?? new Date() } });
+      await tx.passwordResetToken.updateMany({ where: { userId: payload.sub, usedAt: null }, data: { usedAt: new Date() } });
+      await this.sessions.revokeAll(tx, payload.sub);
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // OAuth Facebook / Google (token vérifié, envoyé par le SDK mobile)
+  // ---------------------------------------------------------------------
+  async loginWithFacebook(accessToken: string, nonce?: string): Promise<AuthTokens & { user: PublicUser }> {
+    const profile = await this.facebookProvider.verify(accessToken, nonce);
+    let user = await this.usersService.findByFacebookId(profile.providerId);
+
+    if (!user) {
+      user = await this.usersService.findByEmail(profile.email);
+      if (user) {
+        throw new ConflictException('Log in to the existing account, then explicitly link your social account');
+      } else {
+        user = await this.usersService.createFromSocial({
+          email: profile.email,
+          name: profile.name,
+          provider: AuthProvider.FACEBOOK,
+          facebookId: profile.providerId,
+        });
+      }
+    }
+
+    return this.sessions.create(user.id);
+  }
+
+  async loginWithGoogle(idToken: string): Promise<AuthTokens & { user: PublicUser }> {
+    const profile = await this.googleProvider.verify(idToken);
+    let user = await this.usersService.findByGoogleId(profile.providerId);
+
+    if (!user) {
+      user = await this.usersService.findByEmail(profile.email);
+      if (user) {
+        throw new ConflictException('Log in to the existing account, then explicitly link your social account');
+      } else {
+        user = await this.usersService.createFromSocial({
+          email: profile.email,
+          name: profile.name,
+          provider: AuthProvider.GOOGLE,
+          googleId: profile.providerId,
+        });
+      }
+    }
+
+    return this.sessions.create(user.id);
+  }
+
+  // Lier un compte réseau social à un compte déjà authentifié (V.1 : "the
+  // application must allow them to link their network account")
+  async linkFacebook(userId: string, accessToken: string, nonce?: string): Promise<PublicUser> {
+    const profile = await this.facebookProvider.verify(accessToken, nonce);
+    const owner = await this.usersService.findByFacebookId(profile.providerId);
+    if (owner && owner.id !== userId) {
+      throw new ConflictException('This Facebook account is already linked to another user');
+    }
+    const user = await this.usersService.linkFacebookAccount(userId, profile.providerId);
+    return toPublicUser(user);
+  }
+
+  async linkGoogle(userId: string, idToken: string): Promise<PublicUser> {
+    const profile = await this.googleProvider.verify(idToken);
+    const owner = await this.usersService.findByGoogleId(profile.providerId);
+    if (owner && owner.id !== userId) {
+      throw new ConflictException('This Google account is already linked to another user');
+    }
+    const user = await this.usersService.linkGoogleAccount(userId, profile.providerId);
+    return toPublicUser(user);
+  }
+
+  // Lock the user so concurrent removals cannot remove both remaining providers.
+  async unlinkSocial(userId: string, provider: 'google' | 'facebook'): Promise<PublicUser> {
+    return this.prisma.$transaction(async tx => {
+      await lockUsers(tx, [userId]);
+      const user = await tx.user.findUniqueOrThrow({ where: { id: userId } });
+      const field = provider === 'google' ? 'googleId' : 'facebookId';
+      if (!user[field]) return toPublicUser(user);
+      const other = provider === 'google' ? user.facebookId : user.googleId;
+      if (!other && !(user.passwordHash && user.emailVerifiedAt)) {
+        throw new ConflictException('Link another sign-in method before unlinking this account.');
+      }
+      return toPublicUser(await tx.user.update({ where: { id: userId }, data: { [field]: null } }));
+    });
+  }
+
+  private signPurposeToken(user: User, type: TokenType, expiresIn: JwtSignOptions['expiresIn']): string {
+    const secret =
+      type === 'refresh'
+        ? this.config.getOrThrow<string>('JWT_REFRESH_SECRET')
+        : this.config.getOrThrow<string>('JWT_ACCESS_SECRET');
+    return this.signToken({ sub: user.id, email: user.email, type, jti: randomUUID() }, secret, expiresIn);
+  }
+
+  private signToken(payload: JwtPayload, secret: string, expiresIn: JwtSignOptions['expiresIn']): string {
+    return this.jwtService.sign(payload, { secret, expiresIn });
+  }
+
+  private verifyPurposeToken(token: string, expectedType: TokenType): JwtPayload {
+    const secret =
+      expectedType === 'refresh'
+        ? this.config.getOrThrow<string>('JWT_REFRESH_SECRET')
+        : this.config.getOrThrow<string>('JWT_ACCESS_SECRET');
+
+    let payload: JwtPayload;
+    try {
+      payload = this.jwtService.verify<JwtPayload>(token, { secret, algorithms: ['HS256'] });
+    } catch {
+      throw new UnauthorizedException('Invalid or expired token');
+    }
+
+    if (payload.type !== expectedType || typeof payload.sub !== 'string' || !payload.sub) {
+      throw new UnauthorizedException('Invalid token type');
+    }
+    return payload;
+  }
+}

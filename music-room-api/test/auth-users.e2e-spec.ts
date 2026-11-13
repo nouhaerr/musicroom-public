@@ -1,0 +1,741 @@
+import sharp from 'sharp';
+import { INestApplication, ServiceUnavailableException, ValidationPipe } from '@nestjs/common';
+import { Test } from '@nestjs/testing';
+import { ThrottlerGuard } from '@nestjs/throttler';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import { randomBytes, randomUUID } from 'crypto';
+import { execFileSync } from 'child_process';
+import { PrismaClient } from '../generated/prisma';
+import { PrismaService } from '../src/prisma/prisma.service';
+import { MailService } from '../src/mail/mail.service';
+import { GoogleProvider } from '../src/auth/social/google.provider';
+import { FacebookProvider } from '../src/auth/social/facebook.provider';
+import { SessionsService } from '../src/auth/sessions.service';
+
+// Every run creates and drops ONLY its own random schema. No truncate/reset of public.
+const schema = `musicroom_test_${randomUUID().replace(/-/g, '')}`;
+const verification = new Map<string, string>();
+const resets = new Map<string, string[]>();
+const google = { verify: jest.fn() };
+const facebook = { verify: jest.fn() };
+let app: INestApplication;
+let db: PrismaService;
+let admin: PrismaClient;
+let base: string;
+let schemaCreated = false;
+let throttling: jest.SpyInstance;
+
+async function request(method: string, path: string, body?: unknown, token?: string, headers: Record<string, string> = {}) {
+  const response = await fetch(base + path, {
+    method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const contentType = response.headers.get('content-type') ?? '';
+  return { status: response.status, body: contentType.includes('application/json') ? await response.json() : await response.text() };
+}
+
+async function account(name = 'Listener') {
+  const email = `${randomUUID()}@example.com`;
+  const password = 'Test-password-123!';
+  const registered = await request('POST', '/auth/register', { email, password, name });
+  expect(registered.status).toBe(201);
+  expect(registered.body).not.toHaveProperty('passwordHash');
+  const verified = await request('GET', `/auth/verify-email?token=${verification.get(email)}`);
+  expect(verified.status).toBe(200);
+  const login = await request('POST', '/auth/login', { email, password });
+  expect(login.status).toBe(201);
+  return { ...login.body, id: registered.body.id as string, email, password };
+}
+
+beforeAll(async () => {
+  if (!process.env.TEST_DATABASE_URL) throw new Error('TEST_DATABASE_URL is required; tests use a disposable schema within this database.');
+  const url = new URL(process.env.TEST_DATABASE_URL);
+  admin = new PrismaClient({ datasources: { db: { url: url.href } } });
+  await admin.$executeRawUnsafe(`CREATE SCHEMA "${schema}"`);
+  schemaCreated = true;
+  url.searchParams.set('schema', schema);
+  Object.assign(process.env, {
+    DATABASE_URL: url.href,
+    JWT_ACCESS_SECRET: randomBytes(32).toString('hex'), JWT_REFRESH_SECRET: randomBytes(32).toString('hex'),
+    JWT_ACCESS_EXPIRES_IN: '15m', JWT_REFRESH_EXPIRES_IN: '7d', GOOGLE_AUTH_ENABLED: 'false',
+  });
+  execFileSync(process.execPath, [require.resolve('prisma/build/index.js'), 'migrate', 'deploy'], {
+    env: process.env, stdio: 'pipe', timeout: 60000,
+  });
+  // Load the module only after the test environment is configured.
+  const { AppModule } = await import('../src/app.module');
+  // The global APP_GUARD uses a generated token; override its method only in this test process.
+  throttling = jest.spyOn(ThrottlerGuard.prototype, 'canActivate').mockResolvedValue(true);
+  const module = await Test.createTestingModule({ imports: [AppModule] })
+    .overrideProvider(MailService).useValue({
+      sendVerificationEmail: async (email: string, token: string) => { verification.set(email, token); },
+      sendPasswordResetEmail: async (email: string, token: string) => { resets.set(email, [...(resets.get(email) ?? []), token]); },
+    })
+    .overrideProvider(GoogleProvider).useValue(google)
+    .overrideProvider(FacebookProvider).useValue(facebook)
+    .compile();
+  app = module.createNestApplication({ logger: false });
+  app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
+  await app.listen(0, '127.0.0.1');
+  base = await app.getUrl();
+  db = app.get(PrismaService);
+});
+
+afterAll(async () => {
+  if (app) await app.close();
+  throttling?.mockRestore();
+  if (schemaCreated) await admin.$executeRawUnsafe(`DROP SCHEMA "${schema}" CASCADE`);
+  if (admin) await admin.$disconnect();
+});
+
+describe('Swagger request contracts', () => {
+  it('registers one WEB device per installation and account', async () => {
+    const a = await account();
+    const installationId = randomUUID();
+    const body = { installationId, platform: 'WEB', model: 'Mac · Safari', appVersion: '0.1.0' };
+    const first = await request('POST', '/devices', body, a.accessToken);
+    expect(first.status).toBe(201);
+    const again = await request('POST', '/devices', body, a.accessToken);
+    expect(again.body.id).toBe(first.body.id);
+    expect(first.body.platform).toBe('WEB');
+    const b = await account();
+    const other = await request('POST', '/devices', body, b.accessToken);
+    expect(other.body.id).not.toBe(first.body.id);
+    expect((await request('DELETE', `/devices/${first.body.id}`, undefined, b.accessToken)).status).toBe(404);
+  });
+
+  it('keeps login bodies, social credentials and pagination visible after framework upgrades', () => {
+    const document = SwaggerModule.createDocument(app, new DocumentBuilder().addBearerAuth().build());
+    const schemas = document.components!.schemas!;
+    expect(document.paths['/auth/login'].post!.requestBody).toMatchObject({
+      content: { 'application/json': { schema: { $ref: '#/components/schemas/LoginDto' } } },
+    });
+    expect(schemas.LoginDto).toMatchObject({ required: expect.arrayContaining(['email', 'password']) });
+    expect(schemas.FacebookLoginDto).toMatchObject({ properties: { accessToken: { type: 'string', minLength: 1 } } });
+    expect(schemas.GoogleLoginDto).toMatchObject({ properties: { idToken: { type: 'string', minLength: 1 } } });
+    expect(document.paths['/friends'].get!.parameters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'page', in: 'query' }),
+      expect.objectContaining({ name: 'limit', in: 'query' }),
+    ]));
+  });
+});
+
+describe('Email authentication and persisted sessions', () => {
+  it('still authenticates password hashes produced by bcrypt 5.1.1', async () => {
+    // Synthetic fixture generated before upgrading bcrypt; no real account data.
+    const email = `${randomUUID()}@example.com`;
+    const user = await db.user.create({ data: {
+      email, name: 'Legacy bcrypt account', emailVerifiedAt: new Date(),
+      passwordHash: '$2b$12$d9X43C/pCwUEwPqy/lYvpONe1XXX3oZVeKy.v5GOPfsvAjVF2saxS',
+    } });
+    const login = await request('POST', '/auth/login', { email, password: 'Legacy-fixture-only-2026!' });
+    expect(login.status).toBe(201);
+    expect(login.body.user.id).toBe(user.id);
+    expect((await request('GET', '/users/me', undefined, login.body.accessToken)).status).toBe(200);
+    expect((await request('POST', '/auth/login', { email, password: 'Incorrect-password!' })).status).toBe(401);
+  });
+
+  it('requires valid input and verified email before login', async () => {
+    const email = `${randomUUID()}@example.com`;
+    const password = 'Test-password-123!';
+    expect((await request('POST', '/auth/register', { email, password, name: 'New' })).status).toBe(201);
+    expect((await request('POST', '/auth/login', { email, password })).status).toBe(403);
+    expect((await request('POST', '/auth/login', { email, password: ['bad'] })).status).toBe(400);
+    expect((await request('POST', '/auth/login', { email, password, role: 'admin' })).status).toBe(400);
+    expect((await request('POST', '/auth/login', { email, password: 'wrong' })).status).toBe(401);
+  });
+
+  it('recovers an unverified account after registration email delivery fails', async () => {
+    const email = `${randomUUID()}@example.com`;
+    const password = 'Test-password-123!';
+    const delivery = jest.spyOn(app.get(MailService), 'sendVerificationEmail')
+      .mockRejectedValueOnce(new ServiceUnavailableException('SMTP unavailable'));
+    try {
+      expect((await request('POST', '/auth/register', { email, password, name: 'Mail recovery' })).status).toBe(503);
+      expect(await db.user.count({ where: { email } })).toBe(1);
+      expect(verification.has(email)).toBe(false);
+      expect((await request('POST', '/auth/login', { email, password })).status).toBe(403);
+      expect((await request('POST', '/auth/resend-verification', { email })).status).toBe(201);
+      expect(verification.get(email)).toEqual(expect.any(String));
+      expect((await request('GET', `/auth/verify-email?token=${verification.get(email)}`)).status).toBe(200);
+      expect((await request('POST', '/auth/login', { email, password })).status).toBe(201);
+      expect(await db.user.count({ where: { email } })).toBe(1);
+    } finally {
+      delivery.mockRestore();
+    }
+  });
+
+  it('returns a conflict for concurrent duplicate registrations', async () => {
+    const data = { email: `${randomUUID()}@example.com`, password: 'Test-password-123!', name: 'Duplicate' };
+    const results = await Promise.all([request('POST', '/auth/register', data), request('POST', '/auth/register', data)]);
+    expect(results.map(r => r.status).sort()).toEqual([201, 409]);
+  });
+
+  it('logs out only the current session and immediately rejects its access token', async () => {
+    const a = await account();
+    const other = await request('POST', '/auth/login', { email: a.email, password: a.password });
+    expect((await request('POST', '/auth/logout', {}, a.accessToken)).status).toBe(201);
+    expect((await request('GET', '/users/me', undefined, a.accessToken)).status).toBe(401);
+    expect((await request('POST', '/auth/refresh', { refreshToken: a.refreshToken })).status).toBe(401);
+    expect((await request('GET', '/users/me', undefined, other.body.accessToken)).status).toBe(200);
+    expect((await request('POST', '/auth/refresh', { refreshToken: a.accessToken })).status).toBe(401);
+  });
+
+  it('detects concurrent refresh replay and revokes all sessions, including the winner', async () => {
+    const a = await account();
+    const other = await request('POST', '/auth/login', { email: a.email, password: a.password });
+    const responses = await Promise.all([
+      request('POST', '/auth/refresh', { refreshToken: a.refreshToken }),
+      request('POST', '/auth/refresh', { refreshToken: a.refreshToken }),
+    ]);
+    expect(responses.map(r => r.status).sort()).toEqual([201, 401]);
+    const winner = responses.find(r => r.status === 201)!;
+    expect((await request('GET', '/users/me', undefined, winner.body.accessToken)).status).toBe(401);
+    expect((await request('GET', '/users/me', undefined, other.body.accessToken)).status).toBe(401);
+    expect(await db.authSession.count({ where: { userId: a.id, revokedAt: null } })).toBe(0);
+    const stored = await db.refreshToken.findMany({ where: { session: { userId: a.id } } });
+    expect(stored.every(r => /^[a-f0-9]{64}$/.test(r.tokenHash))).toBe(true);
+  });
+
+  it('consumes reset links once, invalidates other links and revokes every session', async () => {
+    const a = await account();
+    const other = await request('POST', '/auth/login', { email: a.email, password: a.password });
+    expect((await request('POST', '/auth/forgot-password', { email: a.email })).status).toBe(201);
+    expect((await request('POST', '/auth/forgot-password', { email: a.email })).status).toBe(201);
+    const [token, otherToken] = resets.get(a.email)!;
+    expect(token).not.toBe(otherToken);
+    expect((await request('POST', '/auth/reset-password', { token, newPassword: 'No-number-password' })).status).toBe(400);
+    // Invalid input must not consume the reset token or revoke the current session.
+    expect((await request('GET', '/users/me', undefined, a.accessToken)).status).toBe(200);
+    const responses = await Promise.all([
+      request('POST', '/auth/reset-password', { token, newPassword: 'New-password-123!' }),
+      request('POST', '/auth/reset-password', { token, newPassword: 'New-password-123!' }),
+    ]);
+    expect(responses.map(r => r.status).sort()).toEqual([201, 401]);
+    expect((await request('POST', '/auth/reset-password', { token: otherToken, newPassword: 'Another-password-123!' })).status).toBe(401);
+    for (const access of [a.accessToken, other.body.accessToken]) {
+      expect((await request('GET', '/users/me', undefined, access)).status).toBe(401);
+    }
+    expect((await request('POST', '/auth/refresh', { refreshToken: a.refreshToken })).status).toBe(401);
+    expect((await request('POST', '/auth/login', { email: a.email, password: a.password })).status).toBe(401);
+    expect((await request('POST', '/auth/login', { email: a.email, password: 'New-password-123!' })).status).toBe(201);
+  });
+
+  it('rejects credentials validated before a password reset', async () => {
+    const a = await account();
+    const before = await db.user.findUniqueOrThrow({ where: { id: a.id } });
+    await request('POST', '/auth/forgot-password', { email: a.email });
+    await request('POST', '/auth/reset-password', { token: resets.get(a.email)![0], newPassword: 'New-password-123!' });
+    await expect(app.get(SessionsService).create(a.id, before.updatedAt)).rejects.toThrow();
+  });
+});
+
+describe('Social accounts', () => {
+  it.each(['google', 'facebook'] as const)('unlinks %s only for an authenticated owner with a remaining sign-in method', async provider => {
+    const a = await account();
+    const field = provider === 'google' ? 'googleId' : 'facebookId';
+    await db.user.update({ where: { id: a.id }, data: { [field]: randomUUID() } });
+    expect((await request('DELETE', `/auth/link/${provider}`)).status).toBe(401);
+    const result = await request('DELETE', `/auth/link/${provider}`, undefined, a.accessToken);
+    expect(result.status).toBe(200);
+    expect(result.body[field]).toBeNull();
+    expect(result.body.hasPassword).toBe(true);
+    expect(result.body).not.toHaveProperty('passwordHash');
+    expect((await request('POST', '/auth/login', { email: a.email, password: a.password })).status).toBe(201);
+  });
+
+  it('serializes simultaneous unlinks so a social-only user keeps one provider', async () => {
+    const a = await account();
+    await db.user.update({ where: { id: a.id }, data: { passwordHash: null, googleId: randomUUID(), facebookId: randomUUID() } });
+    const results = await Promise.all(['google', 'facebook'].map(provider => request('DELETE', `/auth/link/${provider}`, undefined, a.accessToken)));
+    expect(results.map(r => r.status).sort()).toEqual([200, 409]);
+    const user = await db.user.findUniqueOrThrow({ where: { id: a.id } });
+    expect([user.googleId, user.facebookId].filter(Boolean)).toHaveLength(1);
+  });
+
+  it('does not count an unverified password as a usable replacement', async () => {
+    const a = await account();
+    await db.user.update({ where: { id: a.id }, data: { emailVerifiedAt: null, googleId: randomUUID() } });
+    expect((await request('DELETE', '/auth/link/google', undefined, a.accessToken)).status).toBe(409);
+    expect((await db.user.findUniqueOrThrow({ where: { id: a.id } })).googleId).not.toBeNull();
+  });
+
+  it.each(['google', 'facebook'])('creates one account on first login and reuses its identity (%s)', async provider => {
+    const mock = provider === 'google' ? google : facebook;
+    const providerId = randomUUID();
+    const email = `${randomUUID()}@example.com`;
+    mock.verify.mockResolvedValue({ providerId, email, name: 'New social user' });
+    const body = provider === 'google' ? { idToken: 'provider-token' } : { accessToken: 'provider-token' };
+    const first = await request('POST', `/auth/${provider}`, body);
+    expect(first.status).toBe(201);
+    expect((await request('GET', '/users/me', undefined, first.body.accessToken)).status).toBe(200);
+    const second = await request('POST', `/auth/${provider}`, body);
+    expect(second.status).toBe(201);
+    expect(second.body.user.id).toBe(first.body.user.id);
+    expect(await db.user.count({ where: { email } })).toBe(1);
+    expect((await request('GET', '/users/me', undefined, 'provider-token')).status).toBe(401);
+  });
+
+  it.each(['google', 'facebook'])('rejects empty and oversized social tokens before provider calls (%s)', async provider => {
+    const mock = provider === 'google' ? google : facebook;
+    mock.verify.mockClear();
+    const field = provider === 'google' ? 'idToken' : 'accessToken';
+    for (const token of ['', 'x'.repeat(16385)]) {
+      expect((await request('POST', `/auth/${provider}`, { [field]: token })).status).toBe(400);
+    }
+    expect(mock.verify).not.toHaveBeenCalled();
+  });
+
+  it.each(['google', 'facebook'])('requires explicit linking for an existing email (%s)', async provider => {
+    const a = await account();
+    const mock = provider === 'google' ? google : facebook;
+    const providerId = randomUUID();
+    mock.verify.mockResolvedValue({ providerId, email: a.email, name: 'Social user' });
+    const body = provider === 'google' ? { idToken: 'provider-token' } : { accessToken: 'provider-token' };
+    expect((await request('POST', `/auth/${provider}`, body)).status).toBe(409);
+    expect((await request('POST', `/auth/link/${provider}`, body)).status).toBe(401);
+    expect((await request('POST', `/auth/link/${provider}`, body, a.accessToken)).status).toBe(201);
+    const login = await request('POST', `/auth/${provider}`, body);
+    expect(login.status).toBe(201);
+    expect(login.body.user.id).toBe(a.id);
+    expect(login.body.user).not.toHaveProperty('passwordHash');
+  });
+
+  it('allows only one owner when two accounts link the same social identity concurrently', async () => {
+    const a = await account();
+    const b = await account();
+    google.verify.mockResolvedValue({ providerId: randomUUID(), email: 'social@example.com', name: 'Social' });
+    const results = await Promise.all([
+      request('POST', '/auth/link/google', { idToken: 'token' }, a.accessToken),
+      request('POST', '/auth/link/google', { idToken: 'token' }, b.accessToken),
+    ]);
+    expect(results.map(r => r.status).sort()).toEqual([201, 409]);
+  });
+});
+
+describe('Friend requests and profile visibility', () => {
+  it('enforces ownership, prevents duplicates, and supports reject, cancel, accept and remove', async () => {
+    const a = await account();
+    const b = await account();
+    const c = await account();
+    expect((await request('POST', '/friends/requests', { userId: a.id }, a.accessToken)).status).toBe(400);
+    const results = await Promise.all([
+      request('POST', '/friends/requests', { userId: b.id }, a.accessToken),
+      request('POST', '/friends/requests', { userId: b.id }, a.accessToken),
+    ]);
+    expect(results.map(r => r.status).sort()).toEqual([201, 409]);
+    const id = results.find(r => r.status === 201)!.body.id;
+    expect((await request('POST', `/friends/requests/${id}/accept`, {}, c.accessToken)).status).toBe(404);
+    expect((await request('DELETE', `/friends/requests/${id}`, undefined, b.accessToken)).status).toBe(404);
+    expect((await request('POST', `/friends/requests/${id}/reject`, {}, b.accessToken)).status).toBe(201);
+    await request('POST', '/friends/requests', { userId: b.id }, a.accessToken);
+    expect((await request('DELETE', `/friends/requests/${id}`, undefined, a.accessToken)).status).toBe(200);
+    const resent = await request('POST', '/friends/requests', { userId: b.id }, a.accessToken);
+    expect((await request('POST', `/friends/requests/${resent.body.id}/accept`, {}, b.accessToken)).status).toBe(201);
+    expect((await request('POST', `/friends/requests/${resent.body.id}/accept`, {}, b.accessToken)).status).toBe(409);
+    expect((await request('GET', '/friends', undefined, a.accessToken)).body.map((u: { id: string }) => u.id)).toEqual([b.id]);
+    expect((await request('DELETE', `/friends/${b.id}`, undefined, a.accessToken)).status).toBe(200);
+    expect((await request('GET', '/friends', undefined, b.accessToken)).body).toEqual([]);
+  });
+
+  it('auto-accepts simultaneous mutual requests and applies all profile visibility tiers', async () => {
+    const a = await account('Jazz listener');
+    const b = await account();
+    const c = await account();
+    expect((await request('PATCH', '/users/me', {
+      publicInfo: { bio: 'public' }, friendsOnlyInfo: { bio: 'friends' }, privateInfo: { bio: 'private' }, musicPreferences: [' Jazz ', 'ROCK'],
+    }, a.accessToken)).status).toBe(200);
+    const responses = await Promise.all([
+      request('POST', '/friends/requests', { userId: b.id }, a.accessToken),
+      request('POST', '/friends/requests', { userId: a.id }, b.accessToken),
+    ]);
+    expect(responses.every(r => r.status === 201)).toBe(true);
+    expect(responses.some(r => r.body.status === 'ACCEPTED')).toBe(true);
+    expect(await db.friendRequest.count({ where: { status: 'PENDING', OR: [{ senderId: a.id }, { receiverId: a.id }] } })).toBe(0);
+    expect((await request('GET', `/users/${a.id}`)).status).toBe(401);
+    expect((await request('GET', '/users/search')).status).toBe(401);
+    for (const viewer of [c.accessToken]) {
+      const profile = (await request('GET', `/users/${a.id}`, undefined, viewer)).body;
+      expect(profile.publicInfo.bio).toBe('public');
+      for (const field of ['email', 'passwordHash', 'privateInfo', 'friendsOnlyInfo', 'googleId']) expect(profile).not.toHaveProperty(field);
+    }
+    const friend = (await request('GET', `/users/${a.id}`, undefined, b.accessToken)).body;
+    expect(friend.friendsOnlyInfo.bio).toBe('friends');
+    expect(friend).not.toHaveProperty('privateInfo');
+    expect((await request('GET', `/users/${a.id}`, undefined, a.accessToken)).body.privateInfo.bio).toBe('private');
+    const search = await request('GET', '/users/search?q=Jazz&genre=JAZZ&page=1&limit=1', undefined, a.accessToken);
+    expect(search.status).toBe(200);
+    expect(search.body).toHaveLength(1);
+    expect(search.body[0].musicPreferences).toEqual(['jazz', 'rock']);
+    expect(search.body[0]).not.toHaveProperty('email');
+    const prefix = await request('GET', '/users/search?q=Jazz&genre=JA&page=1&limit=1', undefined, a.accessToken);
+    expect(prefix.status).toBe(200);
+    expect(prefix.body.map((person: { id: string }) => person.id)).toEqual(search.body.map((person: { id: string }) => person.id));
+    const literal = await request('GET', '/users/search?genre=%25&page=1&limit=1', undefined, a.accessToken);
+    expect(literal.status).toBe(200);
+    expect(literal.body).toEqual([]);
+
+    expect((await request('GET', '/users/search?limit=101', undefined, a.accessToken)).status).toBe(400);
+    expect((await request('GET', '/users/search?page=0', undefined, a.accessToken)).status).toBe(400);
+    expect((await request('PATCH', '/users/me', { musicPreferences: { genres: ['jazz'] } }, a.accessToken)).status).toBe(400);
+    expect((await request('PATCH', '/users/me', { musicPreferences: ['Jazz', 'jazz'] }, a.accessToken)).status).toBe(400);
+    await request('DELETE', `/friends/${b.id}`, undefined, a.accessToken);
+    expect((await request('GET', `/users/${a.id}`, undefined, b.accessToken)).body).not.toHaveProperty('friendsOnlyInfo');
+  });
+});
+
+describe.each(['parties', 'playlists'])('%s invitations', resource => {
+  it('hides private resources, handles decline/reinvite/accept and removes access', async () => {
+    const owner = await account();
+    const invited = await account();
+    const stranger = await account();
+    const created = await request('POST', `/${resource}`, { name: 'Private resource', visibility: 'PRIVATE' }, owner.accessToken);
+    expect(created.status).toBe(201);
+    const id = created.body.id;
+    expect((await request('GET', `/${resource}/${id}`, undefined, invited.accessToken)).status).toBe(403);
+    expect((await request('POST', `/${resource}/${id}/invite`, { userId: invited.id }, stranger.accessToken)).status).toBe(403);
+    const invitation = await request('POST', `/${resource}/${id}/invite`, { userId: invited.id }, owner.accessToken);
+    const inviteId = invitation.body.id;
+    expect((await request('GET', '/invitations/me', undefined, invited.accessToken)).body.some((i: { id: string }) => i.id === inviteId)).toBe(true);
+    const canFind = async (token: string) => (await request('GET', `/${resource}`, undefined, token)).body.some((r: { id: string }) => r.id === id);
+    expect(await canFind(invited.accessToken)).toBe(true);
+    expect(await canFind(stranger.accessToken)).toBe(false);
+    expect((await request('POST', `/invitations/${inviteId}/accept`, {}, stranger.accessToken)).status).toBe(404);
+    expect((await request('POST', `/invitations/${inviteId}/decline`, {}, invited.accessToken)).status).toBe(201);
+    expect(await canFind(invited.accessToken)).toBe(false);
+    await request('POST', `/${resource}/${id}/invite`, { userId: invited.id }, owner.accessToken);
+    expect((await request('POST', `/invitations/${inviteId}/accept`, {}, invited.accessToken)).status).toBe(201);
+    expect((await request('GET', `/${resource}/mine`, undefined, invited.accessToken)).body.some((r: { id: string }) => r.id === id)).toBe(true);
+    expect((await request('DELETE', `/${resource}/${id}/invitations/${invited.id}`, undefined, stranger.accessToken)).status).toBe(403);
+    expect((await request('DELETE', `/${resource}/${id}/invitations/${invited.id}`, undefined, owner.accessToken)).status).toBe(200);
+    expect(await canFind(invited.accessToken)).toBe(false);
+    expect((await request('GET', `/${resource}/${id}`, undefined, invited.accessToken)).status).toBe(403);
+  });
+
+  it('cannot restore membership by accepting an invitation concurrently with removal', async () => {
+    const owner = await account();
+    const invited = await account();
+    const created = await request('POST', `/${resource}`, { name: 'Race test', visibility: 'PRIVATE' }, owner.accessToken);
+    const id = created.body.id;
+    const invitation = await request('POST', `/${resource}/${id}/invite`, { userId: invited.id }, owner.accessToken);
+    const [accept, remove] = await Promise.all([
+      request('POST', `/invitations/${invitation.body.id}/accept`, {}, invited.accessToken),
+      request('DELETE', `/${resource}/${id}/invitations/${invited.id}`, undefined, owner.accessToken),
+    ]);
+    expect([201, 409]).toContain(accept.status);
+    expect(remove.status).toBe(200);
+    expect((await request('GET', `/${resource}/${id}`, undefined, invited.accessToken)).status).toBe(403);
+    expect((await db.invitation.findUniqueOrThrow({ where: { id: invitation.body.id } })).status).toBe('REVOKED');
+  });
+});
+
+describe('Device ownership', () => {
+  it('never associates another user’s device with logs and only lets the owner delete it', async () => {
+    const a = await account();
+    const b = await account();
+    const device = (await request('POST', '/devices', { platform: 'IOS', model: 'Test', appVersion: '1' }, a.accessToken)).body;
+    const headers = { 'X-Device-Id': device.id };
+    const before = new Date();
+    await request('GET', '/users/me', undefined, b.accessToken, headers);
+    await request('GET', '/users/me', undefined, a.accessToken, headers);
+    // Logging is intentionally asynchronous; wait for this particular log to be stored.
+    let logs: Awaited<ReturnType<typeof db.actionLog.findMany>> = [];
+    for (let attempt = 0; attempt < 40; attempt++) {
+      logs = await db.actionLog.findMany({ where: { createdAt: { gte: before }, action: 'GET /users/me', userId: { in: [a.id, b.id] } } });
+      if (logs.length >= 2) break;
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    expect(logs.find(l => l.userId === b.id)?.deviceId).toBeNull();
+    expect(logs.find(l => l.userId === a.id)?.deviceId).toBe(device.id);
+    expect((await request('DELETE', `/devices/${device.id}`, undefined, b.accessToken)).status).toBe(404);
+    expect((await request('DELETE', `/devices/${device.id}`, undefined, a.accessToken)).status).toBe(200);
+    expect(await db.device.findUnique({ where: { id: device.id } })).toBeNull();
+  });
+});
+
+describe('Pagination across auth/users/social lists', () => {
+  it('returns distinct, stable pages scoped to the current user and validates list bounds', async () => {
+    const owner = await account();
+    const contacts = [await account('Contact A'), await account('Contact B'), await account('Contact C')];
+    const searchName = `Pagination-${randomUUID()}`;
+    const pendingIds: string[] = [];
+    const deviceIds: string[] = [];
+    const invitationIds: string[] = [];
+    for (const contact of contacts) {
+      expect((await request('PATCH', '/users/me', { name: searchName }, contact.accessToken)).status).toBe(200);
+      const pending = await request('POST', '/friends/requests', { userId: contact.id }, owner.accessToken);
+      expect(pending.status).toBe(201);
+      pendingIds.push(pending.body.id);
+      const device = await request('POST', '/devices', { platform: 'IOS', model: 'Test', appVersion: '1' }, owner.accessToken);
+      expect(device.status).toBe(201);
+      deviceIds.push(device.body.id);
+      const playlist = await request('POST', '/playlists', { name: 'Invitation pagination', visibility: 'PRIVATE' }, contact.accessToken);
+      expect(playlist.status).toBe(201);
+      const invitation = await request('POST', `/playlists/${playlist.body.id}/invite`, { userId: owner.id }, contact.accessToken);
+      expect(invitation.status).toBe(201);
+      invitationIds.push(invitation.body.id);
+    }
+
+    async function checkPages(path: string, expectedIds: string[]) {
+      const separator = path.includes('?') ? '&' : '?';
+      const get = (page: number) => request('GET', `${path}${separator}page=${page}&limit=2`, undefined, owner.accessToken);
+      const first = await get(1);
+      const second = await get(2);
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect(first.body).toHaveLength(2);
+      expect(second.body).toHaveLength(1);
+      const ids = (rows: Array<{ id: string }>) => rows.map(row => row.id);
+      expect([...ids(first.body), ...ids(second.body)].sort()).toEqual([...expectedIds].sort());
+      expect(ids((await get(1)).body)).toEqual(ids(first.body));
+      expect((await get(3)).body).toEqual([]);
+    }
+
+    await checkPages('/friends/requests', pendingIds);
+    await checkPages('/devices', deviceIds);
+    await checkPages('/invitations/me', invitationIds);
+    await checkPages(`/users/search?q=${searchName}`, contacts.map(contact => contact.id));
+    for (let i = 0; i < contacts.length; i++) {
+      expect((await request('POST', `/friends/requests/${pendingIds[i]}/accept`, {}, contacts[i].accessToken)).status).toBe(201);
+    }
+    await checkPages('/friends', contacts.map(contact => contact.id));
+    for (const path of ['/friends', '/friends/requests', '/devices', '/invitations/me', '/users/search']) {
+      for (const query of ['page=0', 'page=1.5', 'limit=101', 'limit=-1']) {
+        expect((await request('GET', `${path}?${query}`, undefined, owner.accessToken)).status).toBe(400);
+      }
+    }
+  });
+});
+
+describe('Login rate limit', () => {
+  it('rejects the eleventh attempt from one IP with the real throttler guard', async () => {
+    // Re-enable the production guard for this test only, in the isolated Nest process.
+    throttling.mockRestore();
+    try {
+      const body = { email: `${randomUUID()}@example.com`, password: 'Wrong-password-123!' };
+      for (let i = 0; i < 10; i++) {
+        expect((await request('POST', '/auth/login', body)).status).toBe(401);
+      }
+      expect((await request('POST', '/auth/login', body)).status).toBe(429);
+    } finally {
+      throttling = jest.spyOn(ThrottlerGuard.prototype, 'canActivate').mockResolvedValue(true);
+    }
+  });
+});
+
+
+describe('Profile photos', () => {
+  it('stores, exposes and removes a validated public photo without changing other profile fields', async () => {
+    const a = await account();
+    const b = await account();
+    await request('PATCH', '/users/me', { publicInfo: { bio: 'Public bio' }, privateInfo: { birthday: '1998-08-14' } }, a.accessToken);
+    const bytes = await sharp({ create: { width: 16, height: 16, channels: 3, background: '#abcdef' } }).jpeg().toBuffer();
+    const image = `data:image/jpeg;base64,${bytes.toString('base64')}`;
+    expect((await request('PUT', '/users/me/avatar', { image })).status).toBe(401);
+    expect((await request('PUT', '/users/me/avatar', { image, userId: b.id }, a.accessToken)).status).toBe(400);
+    expect((await request('PUT', '/users/me/avatar', { image: 'not an image' }, a.accessToken)).status).toBe(400);
+    const saved = await request('PUT', '/users/me/avatar', { image }, a.accessToken);
+    expect(saved.status).toBe(200);
+    expect(saved.body.publicInfo.bio).toBe('Public bio');
+    const avatar = saved.body.publicInfo.avatar;
+    expect(avatar).toMatch(/^data:image\/jpeg;base64,/);
+    expect((await request('GET', `/users/${a.id}`, undefined, b.accessToken)).body.publicInfo.avatar).toBe(avatar);
+    expect((await request('GET', `/users/${a.id}`, undefined, b.accessToken)).body).not.toHaveProperty('privateInfo');
+    // A stale normal profile edit must neither overwrite nor inject an unvalidated avatar.
+    const edited = await request('PATCH', '/users/me', { publicInfo: { bio: 'Updated', avatar: 'https://untrusted.example/photo' } }, a.accessToken);
+    expect(edited.body.publicInfo).toEqual({ bio: 'Updated', avatar });
+    expect((await request('GET', '/users/me', undefined, b.accessToken)).body.publicInfo?.avatar).toBeUndefined();
+    const removed = await request('DELETE', '/users/me/avatar', undefined, a.accessToken);
+    expect(removed.status).toBe(200);
+    expect(removed.body.publicInfo).toEqual({ bio: 'Updated' });
+    expect(removed.body.privateInfo).toEqual({ birthday: '1998-08-14' });
+    const stale = await request('PATCH', '/users/me', { publicInfo: { bio: 'Updated again', avatar } }, a.accessToken);
+    expect(stale.body.publicInfo).not.toHaveProperty('avatar');
+  });
+});
+
+
+describe('Unique usernames and social password setup', () => {
+  it('normalizes usernames, rejects invalid names and resolves concurrent claims with 409', async () => {
+    const a = await account();
+    const b = await account();
+    const username = `u_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
+    const claims = await Promise.all([a, b].map(user => request('PATCH', '/users/me', { username: ` ${username.toUpperCase()} ` }, user.accessToken)));
+    expect(claims.map(r => r.status).sort()).toEqual([200, 409]);
+    const winner = claims[0].status === 200 ? a : b;
+    expect((await request('GET', `/users/${winner.id}`, undefined, b.accessToken)).body.username).toBe(username);
+    const found = await request('GET', `/users/search?q=@${username}`, undefined, b.accessToken);
+    expect(found.body.map((u: { id: string }) => u.id)).toContain(winner.id);
+    for (const invalid of ['ab', 'has space', 'a'.repeat(31), 'ééé', 12]) {
+      expect((await request('PATCH', '/users/me', { username: invalid }, winner.accessToken)).status).toBe(400);
+    }
+    expect((await request('PATCH', '/users/me', { username: null }, winner.accessToken)).body.username).toBeNull();
+    expect((await request('PATCH', '/users/me', { username }, b.accessToken)).status).toBe(200);
+  });
+
+  it.each(['google', 'facebook'] as const)('creates a password for %s only through the emailed single-use link', async provider => {
+    const email = `${randomUUID()}@example.com`;
+    const providerId = randomUUID();
+    (provider === 'google' ? google : facebook).verify.mockResolvedValue({ email, providerId, name: 'Social listener' });
+    const credentials = provider === 'google' ? { idToken: 'token' } : { accessToken: 'token' };
+    const login = await request('POST', `/auth/${provider}`, credentials);
+    expect(login.status).toBe(201);
+    const a = login.body;
+    // Exercise the unverified-mail case too: the mailbox link is what verifies it.
+    await db.user.update({ where: { id: a.user.id }, data: { emailVerifiedAt: null } });
+    expect((await request('POST', '/auth/password/setup')).status).toBe(401);
+    expect((await request('POST', '/auth/password/setup', {}, a.accessToken)).status).toBe(201);
+    expect((await db.user.findUniqueOrThrow({ where: { id: a.user.id } })).passwordHash).toBeNull();
+    const token = resets.get(email)!.at(-1)!;
+    expect((await request('POST', '/auth/reset-password', { token, newPassword: 'withoutdigits' })).status).toBe(400);
+    expect((await request('POST', '/auth/reset-password', { token, newPassword: 'New-password-123!' })).status).toBe(201);
+    expect((await request('GET', '/users/me', undefined, a.accessToken)).status).toBe(401);
+    expect((await request('POST', '/auth/reset-password', { token, newPassword: 'New-password-456!' })).status).toBe(401);
+    const fresh = await request('POST', '/auth/login', { email, password: 'New-password-123!' });
+    expect(fresh.status).toBe(201);
+    expect(fresh.body.user.id).toBe(a.user.id);
+    expect(fresh.body.user.hasPassword).toBe(true);
+    expect(fresh.body.user[provider === 'google' ? 'googleId' : 'facebookId']).toBe(providerId);
+    expect((await request('POST', '/auth/password/setup', {}, fresh.body.accessToken)).status).toBe(409);
+    expect((await request('POST', `/auth/${provider}`, credentials)).body.user.id).toBe(a.user.id);
+  });
+});
+
+
+describe('PR review regressions', () => {
+  it('treats email casing consistently across registration, login, recovery and social login', async () => {
+    const email = `case-${randomUUID()}@example.com`;
+    const password = 'Password-123!';
+    const created = await request('POST', '/auth/register', { email: ` ${email.toUpperCase()} `, password, name: 'Case test' });
+    expect(created.status).toBe(201);
+    expect(created.body.email).toBe(email);
+    expect((await request('POST', '/auth/register', { email, password, name: 'Duplicate' })).status).toBe(409);
+    expect((await request('POST', '/auth/resend-verification', { email: email.toUpperCase() })).status).toBe(201);
+    await request('GET', `/auth/verify-email?token=${verification.get(email)}`);
+    expect((await request('POST', '/auth/login', { email: email.toUpperCase(), password })).body.user.id).toBe(created.body.id);
+    await request('POST', '/auth/forgot-password', { email: email.toUpperCase() });
+    expect(resets.get(email)?.length).toBe(1);
+    for (const [provider, mock] of [['google', google], ['facebook', facebook]] as const) {
+      mock.verify.mockResolvedValue({ email: email.toUpperCase(), providerId: randomUUID(), name: 'Social case test' });
+      expect((await request('POST', `/auth/${provider}`, provider === 'google' ? { idToken: 'test' } : { accessToken: 'test' })).status).toBe(409);
+    }
+    expect(await db.user.count({ where: { email } })).toBe(1);
+  });
+
+  it('prevents concurrent registrations with case variants from creating duplicate accounts', async () => {
+    const email = `race-${randomUUID()}@example.com`;
+    const results = await Promise.all([email, email.toUpperCase()].map(value => request('POST', '/auth/register', { email: value, password: 'Password-123!', name: 'Race' })));
+    expect(results.map(result => result.status).sort()).toEqual([201, 409]);
+  });
+
+  it('rejects oversized display names on registration and profile updates', async () => {
+    const name = 'a'.repeat(101);
+    expect((await request('POST', '/auth/register', { email: `${randomUUID()}@example.com`, password: 'Password-123!', name })).status).toBe(400);
+    const user = await account();
+    expect((await request('PATCH', '/users/me', { name }, user.accessToken)).status).toBe(400);
+  });
+
+  it('does not cache token pages and renders invalid verification links as HTML', async () => {
+    for (const path of ['/auth/reset-password?token=test', '/auth/reset-password', '/auth/verify-email?token=invalid']) {
+      const response = await fetch(base + path);
+      expect(response.headers.get('cache-control')).toBe('no-store');
+      expect(response.headers.get('referrer-policy')).toBe('no-referrer');
+      expect(response.headers.get('content-type')).toContain('text/html');
+      const html = await response.text();
+      expect(html).toContain('<!doctype html>');
+      if (path.includes('verify-email')) {
+        expect(response.status).toBe(401);
+        expect(html).toContain('invalid or expired');
+        expect(html).not.toContain('window.setTimeout');
+      }
+    }
+  });
+});
+
+
+describe('Profile review regressions', () => {
+  it('rejects blank names and trims valid registration and profile names', async () => {
+    const user = await account();
+    for (const name of ['   ', '\t\n', '\u00a0']) {
+      expect((await request('POST', '/auth/register', { email: `${randomUUID()}@example.com`, password: 'Password-123!', name })).status).toBe(400);
+      expect((await request('PATCH', '/users/me', { name }, user.accessToken)).status).toBe(400);
+    }
+    expect((await request('PATCH', '/users/me', { name: ' Alice ' }, user.accessToken)).body.name).toBe('Alice');
+    const email = `${randomUUID()}@example.com`;
+    expect((await request('POST', '/auth/register', { email, password: 'Password-123!', name: ' Bob ' })).status).toBe(201);
+    expect((await db.user.findUniqueOrThrow({ where: { email } })).name).toBe('Bob');
+  });
+
+  it('rejects large, nested and non-text profile fields before transformation', async () => {
+    const user = await account();
+    let nested: unknown = 'text';
+    for (let i = 0; i < 2000; i++) nested = { child: nested };
+    for (const section of ['publicInfo', 'friendsOnlyInfo', 'privateInfo']) {
+      for (const invalid of [null, [], { bio: 'x'.repeat(90000) }, { bio: nested }, { enabled: true },
+        { bio: ['text'] }, { ['k'.repeat(51)]: 'text' },
+        Object.fromEntries(Array.from({ length: 21 }, (_, i) => [`key${i}`, 'text']))]) {
+        expect((await request('PATCH', '/users/me', { [section]: invalid }, user.accessToken)).status).toBe(400);
+      }
+      const valid = { bio: 'x'.repeat(500), city: 'Paris' };
+      expect((await request('PATCH', '/users/me', { [section]: valid }, user.accessToken)).body[section]).toEqual(valid);
+      expect((await request('PATCH', '/users/me', { [section]: { bio: 'x'.repeat(501) } }, user.accessToken)).status).toBe(400);
+      expect((await request('GET', '/users/me', undefined, user.accessToken)).body[section]).toEqual(valid);
+    }
+  });
+});
+
+
+describe('Review regressions: device installation and literal search', () => {
+  it('upserts one installation per account, updates its model and isolates owners', async () => {
+    const a = await account();
+    const b = await account();
+    const installationId = randomUUID();
+    const payload = { platform: 'ANDROID', model: 'Samsung Galaxy A54', appVersion: '1', installationId };
+    const registrations = await Promise.all(Array.from({ length: 4 }, () => request('POST', '/devices', payload, a.accessToken)));
+    expect(registrations.map(r => r.status)).toEqual([201, 201, 201, 201]);
+    expect(new Set(registrations.map(r => r.body.id)).size).toBe(1);
+    const other = await request('POST', '/devices', payload, b.accessToken);
+    expect(other.body.id).not.toBe(registrations[0].body.id);
+    const returned = await request('POST', '/devices', { ...payload, appVersion: '2' }, a.accessToken);
+    expect(returned.body.id).toBe(registrations[0].body.id);
+    expect(returned.body.appVersion).toBe('2');
+    expect(await db.device.count({ where: { userId: a.id, installationId } })).toBe(1);
+    expect((await request('POST', '/devices', { ...payload, installationId: 'invalid' }, a.accessToken)).status).toBe(400);
+  });
+  it('treats percent, underscore and backslash as literal characters', async () => {
+    const viewer = await account();
+    const marker = randomUUID();
+    for (const symbol of ['%', '_', String.fromCharCode(92)]) {
+      const matching = await account(`${marker}${symbol}literal`);
+      await account(`${marker}Xliteral`);
+      const result = await request('GET', `/users/search?q=${encodeURIComponent(marker + symbol)}`, undefined, viewer.accessToken);
+      expect(result.status).toBe(200);
+      expect(result.body.map((u: { id: string }) => u.id)).toEqual([matching.id]);
+    }
+  });
+});
+
+describe('Discovery friendship actions', () => {
+  it('returns persistent outgoing/incoming/accepted states through cancellation and removal', async () => {
+    const name = `Friend-State-${randomUUID()}`;
+    const a = await account(`Sender-${randomUUID()}`);
+    const b = await account(name);
+    const state = async () => {
+      const result = await request('GET', `/users/search?q=${encodeURIComponent(name)}`, undefined, a.accessToken);
+      expect(result.status).toBe(200);
+      return result.body.find((u: { id: string }) => u.id === b.id);
+    };
+    expect((await state()).relationship).toBe('NONE');
+    const sent = await request('POST', '/friends/requests', { userId: b.id }, a.accessToken);
+    expect(await state()).toMatchObject({ relationship: 'OUTGOING', friendRequestId: sent.body.id });
+    const sender = await request('GET', `/users/search?q=${encodeURIComponent(a.user.name)}`, undefined, b.accessToken);
+    expect(sender.body.find((u: { id: string }) => u.id === a.id)).toMatchObject({ relationship: 'INCOMING', friendRequestId: sent.body.id });
+    expect((await request('DELETE', `/friends/requests/${sent.body.id}`, undefined, a.accessToken)).status).toBe(200);
+    expect(await state()).toMatchObject({ relationship: 'NONE', friendRequestId: null });
+    const again = await request('POST', '/friends/requests', { userId: b.id }, a.accessToken);
+    expect((await request('POST', `/friends/requests/${again.body.id}/accept`, {}, b.accessToken)).status).toBe(201);
+    expect(await state()).toMatchObject({ relationship: 'FRIENDS', friendRequestId: null });
+    expect((await request('DELETE', `/friends/${b.id}`, undefined, a.accessToken)).status).toBe(200);
+    expect((await state()).relationship).toBe('NONE');
+  });
+});

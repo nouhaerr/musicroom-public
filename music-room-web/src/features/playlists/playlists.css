@@ -1,0 +1,13 @@
+/* What only the playlist page needs, on top of rooms.css */
+.playlist-header { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 18px; align-items: center; }
+.playlist-header h1 { margin: 0; white-space: normal; }
+.playlist-cover { width: 112px; height: 112px; border-radius: 16px; object-fit: cover; }
+.playlist-handle { width: 32px; height: 44px; display: inline-flex; align-items: center; justify-content: center; border: 0; background: transparent; color: #737d91; cursor: grab; touch-action: none; }
+.playlist-handle:active { cursor: grabbing; }
+.playlist-dragging { position: relative; z-index: 2; background: #1e2230; border-radius: 12px; box-shadow: 0 10px 30px #0009; }
+.rooms-square.playlist-playing { color: #b7f576; border-color: #b7f576; }
+.remote-playback-card{display:grid;gap:12px}.remote-playback-devices,.remote-playback-actions{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.remote-playback-device{display:inline-flex;align-items:center;gap:8px;max-width:100%;padding:9px 12px;border:1px solid #343247;border-radius:12px;background:#171620;color:#aaa4bc;font:inherit;cursor:pointer}.remote-playback-device.selected{border-color:#5966ff;background:#1d254b;color:#c7cbff}.remote-playback-device span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.remote-playback-caption{margin:0;color:#9993aa;font-size:12px}.remote-playback-actions{justify-content:flex-end}.remote-playback-actions button:disabled{opacity:.45;cursor:not-allowed}.remote-playback-progress{display:grid;gap:7px;max-width:520px}.remote-playback-progress-label{display:flex;justify-content:space-between;gap:12px;color:#c7cbff;font-size:12px;font-variant-numeric:tabular-nums}.remote-playback-progress-track{height:5px;overflow:hidden;border-radius:999px;background:#343247}.remote-playback-progress-track span{display:block;height:100%;border-radius:inherit;background:#6874ff;transition:width .35s linear}
+@media (max-width: 520px) {
+  .playlist-header { grid-template-columns: 76px minmax(0, 1fr); gap: 12px; }
+  .playlist-cover { width: 76px; height: 76px; }
+}

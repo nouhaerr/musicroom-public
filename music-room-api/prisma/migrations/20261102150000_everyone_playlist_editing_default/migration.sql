@@ -1,0 +1,1 @@
+ALTER TABLE "Playlist" ALTER COLUMN "editLicense" SET DEFAULT 'EVERYONE';

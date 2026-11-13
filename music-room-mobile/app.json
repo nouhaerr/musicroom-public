@@ -1,0 +1,42 @@
+{
+  "expo": {
+    "name": "Sonora",
+    "slug": "sonora",
+    "owner": "musicrooms-team",
+    "version": "0.1.0",
+    "scheme": "sonora",
+    "platforms": ["ios", "android"],
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "bundleIdentifier": "com.sonora.musicroom",
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "com.sonora.musicroom",
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-secure-store",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Sonora uses your position to check that you are at the party before counting your vote.",
+          "locationAlwaysAndWhenInUsePermission": "Sonora uses your position to check that you are at the party before counting your vote, and, if you turn on \"Rooms nearby\", to tell you when you get close to a room.",
+          "isAndroidBackgroundLocationEnabled": true,
+          "isIosBackgroundLocationEnabled": true
+        }
+      ],
+      "expo-notifications"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "e8bcc21f-46dc-4282-afcf-ae8e3b551782"
+      }
+    }
+  }
+}

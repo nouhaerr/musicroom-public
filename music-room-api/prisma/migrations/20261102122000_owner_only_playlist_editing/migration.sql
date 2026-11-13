@@ -1,0 +1,1 @@
+ALTER TYPE "EditLicense" ADD VALUE 'OWNER_ONLY';

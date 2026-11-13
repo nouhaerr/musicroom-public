@@ -1,0 +1,15 @@
+.sonora-dialog-backdrop{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;padding:20px;background:rgba(5,5,12,.78);backdrop-filter:blur(7px);animation:sonora-dialog-fade .16s ease-out}
+.sonora-dialog{width:min(100%,440px);padding:26px;border:1px solid #383449;border-radius:22px;background:#14131c;color:#f5f3fa;box-shadow:0 24px 90px rgba(0,0,0,.55);animation:sonora-dialog-rise .18s ease-out}
+.sonora-dialog-mark{display:grid;place-items:center;width:42px;height:42px;margin-bottom:18px;border-radius:14px;background:#28223b;color:#bca4ff;font-size:22px}
+.sonora-dialog h2{margin:0 0 9px;font-size:21px;line-height:1.3}
+.sonora-dialog p{margin:0;color:#a9a4b7;font-size:14px;line-height:1.6;overflow-wrap:anywhere}
+.sonora-dialog-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:24px}
+.sonora-dialog-actions button{min-height:44px;padding:0 17px;border:1px solid #353243;border-radius:12px;background:#1c1b26;color:#e8e5ef;font:inherit;font-size:14px;font-weight:600;cursor:pointer}
+.sonora-dialog-actions button:focus-visible{outline:2px solid #bca4ff;outline-offset:3px}
+.sonora-dialog-actions .sonora-dialog-confirm{border-color:#5a58ec;background:#5a58ec;color:white}
+.sonora-dialog-actions .sonora-dialog-confirm.danger{border-color:#8b4058;background:#351c28;color:#ffb3c3}
+.sonora-dialog-actions button:hover{filter:brightness(1.12)}
+@keyframes sonora-dialog-fade{from{opacity:0}to{opacity:1}}
+@keyframes sonora-dialog-rise{from{transform:translateY(8px) scale(.985)}to{transform:translateY(0) scale(1)}}
+@media(max-width:480px){.sonora-dialog{padding:22px}.sonora-dialog-actions button{flex:1}}
+@media(prefers-reduced-motion:reduce){.sonora-dialog-backdrop,.sonora-dialog{animation:none}}

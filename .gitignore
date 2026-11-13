@@ -1,0 +1,27 @@
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Secrets must never be committed, anywhere in the repo (subject V.8)
+.env
+
+# Excluded from the public repository
+.git/
+.agents/
+.codex/
+.aws/
+.presentation_linkedin_build/
+node_modules/
+dist/
+build/
+coverage/
+.env*
+!.env.example
+*.pem
+*.key
+*.p12
+*.p8
+*.jks
+*.mobileprovision
+credentials.json
+credentials/
