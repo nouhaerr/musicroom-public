@@ -25,3 +25,7 @@ coverage/
 *.mobileprovision
 credentials.json
 credentials/
+
+# Local design and presentation materials
+/MobileDesign/
+/presentation_linkedin/
